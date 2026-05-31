@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@theme {
+  /* Surfaces — tinted neutrals toward signal-blue hue */
+  --color-surface-base:     oklch(9%  0.008 240);
+  --color-surface-raised:   oklch(13% 0.007 240);
+  --color-surface-elevated: oklch(18% 0.006 240);
+  --color-surface-border:   oklch(24% 0.005 240);
+
+  /* Foreground / text */
+  --color-fg:        oklch(91% 0.005 240);
+  --color-fg-subtle: oklch(62% 0.005 240);
+  --color-fg-muted:  oklch(44% 0.005 240);
+
+  /* Accent */
+  --color-accent:       oklch(55% 0.21 255);
+  --color-accent-hover: oklch(60% 0.19 255);
+
+  /* Pipeline segment states */
+  --color-pipe-done:    oklch(30% 0.006 240);
+  --color-pipe-pending: oklch(16% 0.004 240);
+
+  /* Semantic */
+  --color-error:   oklch(60% 0.18 25);
+  --color-success: oklch(60% 0.14 145);
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Code", monospace;
+}
+
+/* Light theme — overrides the @theme defaults on :root */
+.light {
+  --color-surface-base:     oklch(97%  0.004 240);
+  --color-surface-raised:   oklch(93%  0.005 240);
+  --color-surface-elevated: oklch(89%  0.006 240);
+  --color-surface-border:   oklch(76%  0.007 240);
+
+  --color-fg:        oklch(14%  0.008 240);
+  --color-fg-subtle: oklch(36%  0.007 240);
+  --color-fg-muted:  oklch(54%  0.006 240);
+
+  --color-pipe-done:    oklch(72%  0.006 240);
+  --color-pipe-pending: oklch(87%  0.004 240);
+
+  --color-error:   oklch(52% 0.18 25);
+  --color-success: oklch(44% 0.14 145);
+}
+
+/* Theme transition — enable smooth color crossfade for ~350ms around a theme toggle */
+html.theme-transition,
+html.theme-transition *,
+html.theme-transition *::before,
+html.theme-transition *::after {
+  transition:
+    background-color 300ms ease,
+    color 250ms ease,
+    border-color 300ms ease,
+    fill 250ms ease,
+    stroke 250ms ease !important;
+  transition-delay: 0ms !important;
+}
+
+/* Theme-toggle icon — rotate-in on mount */
+@keyframes theme-icon-in {
+  from { transform: rotate(-45deg) scale(0.6); opacity: 0; }
+  to   { transform: rotate(0deg)   scale(1);   opacity: 1; }
+}
+
+.theme-icon-enter {
+  animation: theme-icon-in 200ms ease-out forwards;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--color-surface-base);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+}

@@ -1,0 +1,10 @@
+# Desktop / Rust — not needed for web deployment
+apps/desktop/
+packages/ui/node_modules/
+
+# Python sidecar
+*.py
+
+# Build artifacts
+**/target/
+**/.next/cache/

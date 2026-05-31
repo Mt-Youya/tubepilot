@@ -1,0 +1,68 @@
+# OS
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+
+# TypeScript incremental build cache
+tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
+next-env.d.ts
+**/next-env.d.ts
+
+# Build output
+dist/
+build/
+
+# Env
+.env
+.env.local
+.env*.local
+
+# Editor
+.vscode/
+.idea/
+.catpaw/
+
+# Turbo
+.turbo/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Rust
+target/
+*.prof
+*.raw
+rustc-ice-*.txt
+.cargo/
+**/*.rs.bk
+*.pdb
+out/
+
+# Tauri
+# gen/schemas 由 tauri build 自动生成
+packages/desktop/src-tauri/gen/
+# desktop resources（平台二进制，CI 构建时动态生成）
+packages/desktop/src-tauri/resources/
+packages/desktop/src-tauri/target-check
+
+
+settings.local.json
+
+# Claude Code 本地配置（含本机绝对路径）
+# .claude/launch.json
+
+# Codex
+.codex-run/
