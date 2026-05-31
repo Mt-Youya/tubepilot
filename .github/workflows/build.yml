@@ -57,8 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-13       # Intel runner — for x86_64 binary
-            args: ""
           - platform: macos-latest   # Apple Silicon (M1) runner
             args: ""
           - platform: ubuntu-22.04
