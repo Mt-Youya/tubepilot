@@ -111,6 +111,7 @@ jobs:
         with:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
+          packageManager: pnpm
 
       - name: Upload artifacts (macOS)
         if: runner.os == 'macOS'
