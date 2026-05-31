@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Analytics } from "@vercel/analytics/next";
 import { SettingsProvider } from "../lib/settings-context";
 import "./globals.css";
 
@@ -24,6 +25,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body>
         <SettingsProvider>{children}</SettingsProvider>
+        <Analytics />
       </body>
     </html>
   );
