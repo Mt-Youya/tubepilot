@@ -3,6 +3,5 @@
   "installCommand": "pnpm install",
   "buildCommand": "pnpm --filter @tubepilot/web build",
   "outputDirectory": "apps/web/.next",
-  "framework": "nextjs",
-  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- apps/web packages/ui"
+  "framework": "nextjs"
 }
