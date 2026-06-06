@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// On macOS/Linux, checks known install locations before falling back to PATH.
 fn python_exe() -> String {
     if cfg!(windows) {
-        return "python"
+        return "python".to_string()
     }
     let candidates = [
         "/opt/miniconda3/bin/python3",
