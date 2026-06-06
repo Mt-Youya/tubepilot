@@ -5,7 +5,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// Cross-platform Python executable path.
 /// On macOS/Linux, checks known install locations before falling back to PATH.
 fn python_exe() -> String {
-    if cfg!(windows) { "python" } else { "python3" }
+    if cfg!(windows) {
+        return "python"
+    }
     let candidates = [
         "/opt/miniconda3/bin/python3",
         "/opt/homebrew/bin/python3",
