@@ -2,9 +2,21 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Cross-platform Python executable name.
-fn python_exe() -> &'static str {
+/// Cross-platform Python executable path.
+/// On macOS/Linux, checks known install locations before falling back to PATH.
+fn python_exe() -> String {
     if cfg!(windows) { "python" } else { "python3" }
+    let candidates = [
+        "/opt/miniconda3/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ];
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+    }
+    "python3".to_string()
 }
 
 /// Cross-platform temp directory (replaces hard-coded "/tmp").
@@ -126,6 +138,91 @@ fn save_bili_creds(creds: &BiliCredentials, app: &AppHandle) {
     }
 }
 
+// ── Job cache ─────────────────────────────────────────────────────────────────
+
+fn job_cache_dir(app: &AppHandle, job_id: &str) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| tmp_dir())
+        .join("jobs")
+        .join(job_id)
+}
+
+fn persist_job(job: &Job, app: &AppHandle) {
+    let dir = job_cache_dir(app, &job.id);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string(job) {
+        let _ = std::fs::write(dir.join("job.json"), json);
+    }
+}
+
+fn persist_subtitles(job_id: &str, segs: &[SubtitleSegment], app: &AppHandle) {
+    let dir = job_cache_dir(app, job_id);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string(segs) {
+        let _ = std::fs::write(dir.join("subtitles.json"), json);
+    }
+}
+
+fn persist_raw_segments(job_id: &str, segs: &[serde_json::Value], app: &AppHandle) {
+    let dir = job_cache_dir(app, job_id);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string(segs) {
+        let _ = std::fs::write(dir.join("raw_segments.json"), json);
+    }
+}
+
+fn load_cached_subtitles(app: &AppHandle, job_id: &str) -> Option<Vec<SubtitleSegment>> {
+    let data = std::fs::read_to_string(job_cache_dir(app, job_id).join("subtitles.json")).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn load_cached_raw_segments(app: &AppHandle, job_id: &str) -> Option<Vec<serde_json::Value>> {
+    let data = std::fs::read_to_string(job_cache_dir(app, job_id).join("raw_segments.json")).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Load all persisted jobs on app startup.
+/// Jobs stuck in Processing (app was force-quit) are marked as Error so user can retry.
+fn load_all_cached_jobs(
+    app: &AppHandle,
+) -> (HashMap<String, Job>, HashMap<String, Vec<SubtitleSegment>>) {
+    let jobs_dir = app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| tmp_dir())
+        .join("jobs");
+
+    let mut jobs: HashMap<String, Job> = HashMap::new();
+    let mut subtitles: HashMap<String, Vec<SubtitleSegment>> = HashMap::new();
+
+    let Ok(entries) = std::fs::read_dir(&jobs_dir) else { return (jobs, subtitles); };
+
+    for entry in entries.flatten() {
+        let Ok(data) = std::fs::read_to_string(entry.path().join("job.json")) else { continue; };
+        let Ok(mut job) = serde_json::from_str::<Job>(&data) else { continue; };
+
+        // Jobs that were mid-flight when the app closed can't resume automatically
+        if job.status == JobStatus::Processing {
+            job.status = JobStatus::Error;
+            job.error_note = Some("应用已重启，请点击重试".to_string());
+        }
+
+        // If subtitles are cached, ensure stage reflects that
+        if let Some(segs) = load_cached_subtitles(app, &job.id) {
+            if job.stage.0 < PipelineStage::REVIEW.0 {
+                job.stage = PipelineStage::REVIEW;
+                job.status = JobStatus::Ready;
+                job.error_note = None;
+            }
+            subtitles.insert(job.id.clone(), segs);
+        }
+
+        jobs.insert(job.id.clone(), job);
+    }
+
+    (jobs, subtitles)
+}
+
 /// Simple percent-decode (handles %XX and + → space).
 fn url_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -231,6 +328,7 @@ fn delete_job(id: String, state: State<AppState>, app: AppHandle) -> Result<(), 
         jobs.remove(&id);
     }
     state.subtitles.lock().map_err(|e| e.to_string())?.remove(&id);
+    let _ = std::fs::remove_dir_all(job_cache_dir(&app, &id));
     app.emit("job:deleted", &id).ok();
     Ok(())
 }
@@ -242,10 +340,22 @@ fn retry_job(id: String, state: State<AppState>, app: AppHandle) -> Result<(), S
         let mut jobs = state.jobs.lock().map_err(|e| e.to_string())?;
         let job = jobs.get_mut(&id).ok_or("job not found")?;
         job.status = JobStatus::Processing;
-        job.stage = PipelineStage::FETCH;
         job.error_note = None;
-        job.status_note = Some("正在获取视频信息...".to_string());
         job.elapsed_secs = Some(0);
+        // Resume from the furthest cached stage instead of restarting from scratch
+        job.stage = if load_cached_subtitles(&app, &id).is_some() {
+            job.status_note = Some("字幕已缓存，直接进入校对...".to_string());
+            PipelineStage::REVIEW
+        } else if load_cached_raw_segments(&app, &id).is_some() {
+            job.status_note = Some("字幕已获取，继续翻译...".to_string());
+            PipelineStage::TRANSLATE
+        } else if job.title.is_some() {
+            job.status_note = Some("继续获取字幕...".to_string());
+            PipelineStage::TRANSCRIBE
+        } else {
+            job.status_note = Some("正在获取视频信息...".to_string());
+            PipelineStage::FETCH
+        };
         url = job.url.clone();
         app.emit("job:updated", job.clone()).ok();
     }
@@ -270,6 +380,7 @@ fn update_subtitle(
     seg_id: i32,
     zh: String,
     state: State<AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
     let mut subtitles = state.subtitles.lock().map_err(|e| e.to_string())?;
     let segs = subtitles.get_mut(&job_id).ok_or("subtitles not found")?;
@@ -277,6 +388,7 @@ fn update_subtitle(
         seg.zh = zh;
         seg.approved = false;
     }
+    persist_subtitles(&job_id, segs, &app);
     Ok(())
 }
 
@@ -286,12 +398,14 @@ fn approve_subtitle(
     seg_id: i32,
     approved: bool,
     state: State<AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
     let mut subtitles = state.subtitles.lock().map_err(|e| e.to_string())?;
     let segs = subtitles.get_mut(&job_id).ok_or("subtitles not found")?;
     if let Some(seg) = segs.iter_mut().find(|s| s.id == seg_id) {
         seg.approved = approved;
     }
+    persist_subtitles(&job_id, segs, &app);
     Ok(())
 }
 
@@ -537,16 +651,18 @@ async fn start_publish_job(
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
 async fn run_pipeline(job_id: String, url: String, app: AppHandle) {
-    // Stage 0: Fetch metadata
-    let meta = match sidecar_fetch_metadata(&url).await {
-        Ok(m) => m,
-        Err(e) => {
-            set_job_error(&job_id, e, &app);
-            return;
-        }
+    // Stage 0: Fetch metadata — skip if job already has a title (cached from previous run)
+    let has_title = {
+        let state = app.state::<AppState>();
+        let jobs = state.jobs.lock().unwrap();
+        jobs.get(&job_id).and_then(|j| j.title.as_ref()).is_some()
     };
 
-    {
+    if !has_title {
+        let meta = match sidecar_fetch_metadata(&url).await {
+            Ok(m) => m,
+            Err(e) => { set_job_error(&job_id, e, &app); return; }
+        };
         let state = app.state::<AppState>();
         let mut jobs = state.jobs.lock().unwrap();
         if let Some(job) = jobs.get_mut(&job_id) {
@@ -556,34 +672,67 @@ async fn run_pipeline(job_id: String, url: String, app: AppHandle) {
             job.duration = Some(meta.duration);
             job.thumbnail_url = meta.thumbnail_url;
             app.emit("job:updated", job.clone()).ok();
+            persist_job(job, &app);
         }
     }
 
-    // Start video download concurrently with transcription
+    // Start video download concurrently with transcription — skip if already downloaded
     {
-        let dl_job_id  = job_id.clone();
-        let dl_url     = url.clone();
-        let dl_app     = app.clone();
-        let dl_dir     = app.state::<AppState>().settings.lock().unwrap().download_dir.clone();
-        tokio::spawn(async move {
-            sidecar_download(&dl_job_id, &dl_url, &dl_dir, &dl_app).await;
-        });
+        let already_downloaded = {
+            let state = app.state::<AppState>();
+            let jobs = state.jobs.lock().unwrap();
+            jobs.get(&job_id)
+                .and_then(|j| j.video_path.as_ref())
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        };
+        if !already_downloaded {
+            let dl_job_id = job_id.clone();
+            let dl_url    = url.clone();
+            let dl_app    = app.clone();
+            let dl_dir    = app.state::<AppState>().settings.lock().unwrap().download_dir.clone();
+            tokio::spawn(async move {
+                sidecar_download(&dl_job_id, &dl_url, &dl_dir, &dl_app).await;
+            });
+        }
     }
 
-    // Stage 1: Transcribe (or fetch YouTube subtitles)
-    set_job_stage(&job_id, PipelineStage::TRANSCRIBE, &app);
-    if is_cancelled(&job_id, &app) { return; }
+    // Fast path: final subtitles already cached → skip to Review
+    if let Some(cached_segs) = load_cached_subtitles(&app, &job_id) {
+        let state = app.state::<AppState>();
+        state.subtitles.lock().unwrap().insert(job_id.clone(), cached_segs);
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if job.status == JobStatus::Cancelled { return; }
+            job.stage = PipelineStage::REVIEW;
+            job.status = JobStatus::Ready;
+            job.status_note = None;
+            app.emit("job:updated", job.clone()).ok();
+            persist_job(job, &app);
+        }
+        return;
+    }
 
-    let (raw_segments, zh_available) = match sidecar_transcribe(&job_id, &url, &app).await {
-        Ok(t) => t,
-        Err(e) => { set_job_error(&job_id, e, &app); return; }
+    // Stage 1: Transcribe — skip if raw segments already cached (TRANSLATE previously failed)
+    let (raw_segments, zh_available) = if let Some(cached) = load_cached_raw_segments(&app, &job_id) {
+        set_job_stage(&job_id, PipelineStage::TRANSLATE, &app);
+        (cached, false)
+    } else {
+        set_job_stage(&job_id, PipelineStage::TRANSCRIBE, &app);
+        if is_cancelled(&job_id, &app) { return; }
+        match sidecar_transcribe(&job_id, &url, &app).await {
+            Ok((segs, zh)) => {
+                // Cache raw English segments so a TRANSLATE failure can resume here
+                if !zh { persist_raw_segments(&job_id, &segs, &app); }
+                (segs, zh)
+            }
+            Err(e) => { set_job_error(&job_id, e, &app); return; }
+        }
     };
 
     // Stage 2: Translate — skip if YouTube already provided zh captions
     let final_segments = if zh_available {
-        match serde_json::from_value::<Vec<SubtitleSegment>>(
-            serde_json::Value::Array(raw_segments)
-        ) {
+        match serde_json::from_value::<Vec<SubtitleSegment>>(serde_json::Value::Array(raw_segments)) {
             Ok(s) => s,
             Err(e) => { set_job_error(&job_id, format!("Segment parse error: {e}"), &app); return; }
         }
@@ -596,7 +745,11 @@ async fn run_pipeline(job_id: String, url: String, app: AppHandle) {
         }
     };
 
-    // Store subtitles and move to Review
+    // Persist final subtitles; raw segments no longer needed
+    persist_subtitles(&job_id, &final_segments, &app);
+    let _ = std::fs::remove_file(job_cache_dir(&app, &job_id).join("raw_segments.json"));
+
+    // Store subtitles in memory and move to Review
     {
         let state = app.state::<AppState>();
         state.subtitles.lock().unwrap().insert(job_id.clone(), final_segments);
@@ -605,7 +758,9 @@ async fn run_pipeline(job_id: String, url: String, app: AppHandle) {
             if job.status == JobStatus::Cancelled { return; }
             job.stage = PipelineStage::REVIEW;
             job.status = JobStatus::Ready;
+            job.status_note = None;
             app.emit("job:updated", job.clone()).ok();
+            persist_job(job, &app);
         }
     }
 }
@@ -667,8 +822,9 @@ fn progress_note(stage: &str, step: &str) -> &'static str {
         ("publish",    "translating_meta")  => "正在翻译标题和简介...",
         ("publish",    "upload_video")     => "准备上传到B站...",
         ("publish",    "uploading_chunks") => "正在上传视频...",
-        ("publish",    "submitting")       => "正在提交...",
-        ("publish",    "done")             => "发布成功",
+        ("publish",    "submitting")         => "正在提交...",
+        ("publish",    "uploading_subtitle") => "正在上传字幕...",
+        ("publish",    "done")               => "发布成功",
         _                                  => "",
     }
 }
@@ -1207,6 +1363,11 @@ pub fn run() {
             // Load persisted settings
             let settings = load_settings_from_disk(&app.handle().clone());
             *state.settings.lock().unwrap() = settings;
+            // Load persisted jobs and subtitles from previous sessions
+            let handle = app.handle().clone();
+            let (cached_jobs, cached_subs) = load_all_cached_jobs(&handle);
+            *state.jobs.lock().unwrap() = cached_jobs;
+            *state.subtitles.lock().unwrap() = cached_subs;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

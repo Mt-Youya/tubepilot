@@ -22,6 +22,8 @@ Dependencies:
   pip install tencentcloud-sdk-python-tmt  # only for Tencent
 """
 
+from __future__ import annotations
+
 import re
 import sys
 import json
@@ -51,6 +53,34 @@ def _tencent_release() -> None:
     threading.Thread(target=_release, daemon=True).start()
 
 
+# ── Node.js helper ───────────────────────────────────────────────────────────
+
+def _find_node() -> str | None:
+    """Find node binary: PATH first, then common fnm/nvm/brew stable locations."""
+    import shutil as _shutil
+    node = _shutil.which("node")
+    if node:
+        return node
+    # fnm stores versions at stable paths not in Tauri's PATH
+    candidates = [
+        # fnm (Linux/macOS)
+        *sorted(Path(os.path.expanduser(
+            "~/.local/share/fnm/node-versions"
+        )).glob("*/installation/bin/node"), reverse=True),
+        # nvm
+        *sorted(Path(os.path.expanduser(
+            "~/.nvm/versions/node"
+        )).glob("*/bin/node"), reverse=True),
+        # Homebrew
+        Path("/opt/homebrew/bin/node"),
+        Path("/usr/local/bin/node"),
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return str(p)
+    return None
+
+
 # ── YouTube cookie helper ─────────────────────────────────────────────────────
 
 def _cookie_opts() -> dict:
@@ -77,16 +107,26 @@ def _cookie_opts() -> dict:
     candidates: list[str] = []
 
     if system == "Darwin":  # macOS
-        if Path(os.path.expanduser("~/Library/Safari")).exists():
-            candidates.append("safari")
+        # Chrome first — most likely to have an active YouTube session
+        if Path(os.path.expanduser(
+            "~/Library/Application Support/Google/Chrome"
+        )).exists():
+            candidates.append("chrome")
         if shutil.which("firefox") or Path(
             os.path.expanduser("~/Library/Application Support/Firefox")
         ).exists():
             candidates.append("firefox")
-        if Path(
-            os.path.expanduser("~/Library/Application Support/Google/Chrome")
-        ).exists():
-            candidates.append("chrome")
+        # Safari cookies are sandbox-protected; probe with an actual read
+        safari_cookies = Path(os.path.expanduser(
+            "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
+        ))
+        if safari_cookies.exists():
+            try:
+                with open(safari_cookies, "rb") as _f:
+                    _f.read(1)
+                candidates.append("safari")
+            except OSError:
+                pass  # sandbox or permission denied — skip safari
 
     elif system == "Windows":
         local = os.environ.get("LOCALAPPDATA", "")
@@ -108,6 +148,39 @@ def _cookie_opts() -> dict:
 
     if candidates:
         return {"cookiesfrombrowser": (candidates[0],)}
+    return {}
+
+
+# ── Proxy helper ──────────────────────────────────────────────────────────────
+
+def _proxy_opts() -> dict:
+    """Return yt-dlp proxy option.
+
+    Priority:
+      1. YTDLP_PROXY env var (explicit override)
+      2. Standard HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
+      3. macOS system proxy settings (read via urllib, covers Surge/ClashX/etc.)
+    """
+    explicit = os.environ.get("YTDLP_PROXY", "").strip()
+    if explicit:
+        return {"proxy": explicit}
+
+    # Standard env vars (GUI apps often don't inherit shell exports)
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return {"proxy": val}
+
+    # Read macOS system proxy (works even without env vars)
+    try:
+        from urllib.request import getproxies
+        proxies = getproxies()
+        proxy = proxies.get("https") or proxies.get("http")
+        if proxy:
+            return {"proxy": proxy}
+    except Exception:
+        pass
+
     return {}
 
 
@@ -155,12 +228,23 @@ def fetch_metadata(url: str) -> None:
     except ImportError:
         fatal("yt-dlp not installed — run: pip install yt-dlp")
 
-    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, **_cookie_opts()}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        fatal(f"yt-dlp metadata error: {e}")
+    _node = _find_node()
+    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                 **_cookie_opts(), **_proxy_opts(),
+                 **(_node and {"js_runtimes": {"node": {"path": _node}}} or {})}
+    info = None
+    last_err = None
+    for extra in ({}, {"nocheckcertificate": True}):  # retry without SSL verify on failure
+        try:
+            with yt_dlp.YoutubeDL({**base_opts, **extra}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as e:
+            last_err = e
+            if "SSL" not in str(e) and "EOF" not in str(e):
+                break  # non-SSL error, no point retrying
+    if info is None:
+        fatal(f"yt-dlp metadata error: {last_err}")
 
     print(json.dumps({
         "title": info.get("title", "Unknown"),
@@ -228,6 +312,7 @@ def transcribe(job_id: str, url: str) -> None:
         fatal("No subtitles found and openai-whisper not installed. "
               "Run: pip install openai-whisper  (or ensure the video has captions)")
 
+    _node = _find_node()
     ydl_audio_opts = {
         "format": "bestaudio/best",
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
@@ -235,6 +320,8 @@ def transcribe(job_id: str, url: str) -> None:
         "quiet": True,
         "no_warnings": True,
         **_cookie_opts(),
+        **_proxy_opts(),
+        **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_audio_opts) as ydl:
@@ -293,12 +380,14 @@ def _fetch_timedtext(video_id: str, tlang: str | None) -> str | None:
     if tlang:
         params["tlang"] = tlang
 
+    proxy = _proxy_opts().get("proxy")
     try:
         resp = requests.get(
             "https://www.youtube.com/api/timedtext",
             params=params,
             timeout=20,
             headers={"User-Agent": "Mozilla/5.0"},
+            proxies={"https": proxy, "http": proxy} if proxy else None,
         )
         if resp.status_code == 200 and "WEBVTT" in resp.text:
             return resp.text
@@ -317,7 +406,7 @@ def _download_subtitles_multi(url: str, langs: list[str], work_dir: Path) -> dic
         try: f.unlink()
         except Exception: pass
 
-    node_path = shutil.which("node")
+    node_path = _find_node()
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -329,6 +418,7 @@ def _download_subtitles_multi(url: str, langs: list[str], work_dir: Path) -> dic
         "outtmpl": str(work_dir / "sub.%(ext)s"),
         "ignoreerrors": True,   # continue past 429 on individual languages
         **_cookie_opts(),
+        **_proxy_opts(),
         **({"js_runtimes": {"node": {"path": node_path}}} if node_path else {}),
     }
     try:
@@ -358,7 +448,7 @@ def _download_subtitle(url: str, lang_candidates: list[str], work_dir: Path) -> 
     """
     import yt_dlp, shutil
 
-    node_path = shutil.which("node")
+    node_path = _find_node()
     base_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -369,6 +459,7 @@ def _download_subtitle(url: str, lang_candidates: list[str], work_dir: Path) -> 
         "outtmpl": str(work_dir / "sub.%(ext)s"),
         "ignoreerrors": True,   # continue past 429 on individual languages
         **_cookie_opts(),
+        **_proxy_opts(),
         **({"js_runtimes": {"node": {"path": node_path}}} if node_path else {}),
     }
 
@@ -713,6 +804,12 @@ def publish(job_id: str, meta_file: str) -> None:
             fatal(f"投稿提交失败：{e}")
 
     bvid = ret.get("data", {}).get("bvid", "")
+
+    # Upload CC subtitle (non-fatal — video is already published)
+    if bvid and subtitles:
+        progress("publish", "uploading_subtitle", 95)
+        _upload_bili_cc_subtitle(bvid, subtitles, sessdata, bili_jct)
+
     progress("publish", "done", 100)
     print(json.dumps({"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}"}), flush=True)
 
@@ -752,6 +849,7 @@ def download_video_cmd(job_id: str, url: str, output_dir: str) -> None:
 def _download_video(url: str, work_dir: Path, *, progress_hook=None) -> Path:
     """Download best quality mp4 video via yt-dlp (4 concurrent fragments)."""
     import yt_dlp
+    _node = _find_node()
     opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": str(work_dir / "video.%(ext)s"),
@@ -760,6 +858,8 @@ def _download_video(url: str, work_dir: Path, *, progress_hook=None) -> Path:
         "merge_output_format": "mp4",
         "concurrent_fragment_downloads": 4,
         **_cookie_opts(),
+        **_proxy_opts(),
+        **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
     }
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
@@ -791,6 +891,90 @@ def _srt_fmt(secs: float) -> str:
     s  = int(secs % 60)
     ms = int((secs % 1) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+# ── Bilibili CC subtitle upload ───────────────────────────────────────────────
+
+def _upload_bili_cc_subtitle(
+    bvid: str,
+    segments: list[dict],
+    sessdata: str,
+    bili_jct: str,
+) -> None:
+    """Upload CC subtitle to Bilibili after video is published.
+
+    Flow:
+      1. GET /x/web-interface/view?bvid= → cid
+      2. Convert segments → B站 CC JSON format
+      3. POST /x/v2/dm/subtitle/draft/save
+    Non-fatal: errors are silently swallowed so publish still succeeds.
+    """
+    if not segments or not bvid:
+        return
+    try:
+        import requests as _req
+    except ImportError:
+        return
+
+    session = _req.Session()
+    session.cookies.set("SESSDATA", sessdata)
+    session.cookies.set("bili_jct",  bili_jct)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.bilibili.com",
+    })
+
+    try:
+        # 1. Get CID (content id of the first video part)
+        r = session.get(
+            "https://api.bilibili.com/x/web-interface/view",
+            params={"bvid": bvid}, timeout=20,
+        )
+        cid = r.json().get("data", {}).get("cid")
+        if not cid:
+            return
+
+        # 2. Build B站 CC JSON format
+        body = []
+        for seg in segments:
+            text = (seg.get("zh") or seg.get("en") or "").strip()
+            if text:
+                body.append({
+                    "from":     round(float(seg["inTime"]),  3),
+                    "to":       round(float(seg["outTime"]), 3),
+                    "location": 2,   # bottom center
+                    "content":  text,
+                })
+        if not body:
+            return
+
+        cc_data = json.dumps({
+            "font_size":         0.4,
+            "font_color":        "#FFFFFF",
+            "background_alpha":  0.5,
+            "background_color":  "#9C27B0",
+            "Stroke":            "none",
+            "body":              body,
+        }, ensure_ascii=False)
+
+        # 3. Upload subtitle draft
+        session.post(
+            "https://api.bilibili.com/x/v2/dm/subtitle/draft/save",
+            data={
+                "type":   1,
+                "oid":    cid,
+                "lan":    "zh-CN",
+                "data":   cc_data,
+                "csrf":   bili_jct,
+                "submit": "true",
+                "sign":   "false",
+                "bvid":   bvid,
+            },
+            timeout=30,
+        )
+    except Exception:
+        pass  # non-fatal — subtitle upload failure shouldn't block publish
 
 
 # ── language / translation helpers ───────────────────────────────────────────
