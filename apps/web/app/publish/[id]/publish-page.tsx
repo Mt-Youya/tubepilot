@@ -140,15 +140,21 @@ export default function PublishPageClient() {
             <label className="text-[11px] font-semibold tracking-[0.1em] uppercase text-fg-muted">
               分区
             </label>
-            <select
-              value={tid}
-              onChange={e => setTid(Number(e.target.value))}
-              className="bg-surface-elevated border border-surface-border rounded-sm px-3 py-2 text-sm text-fg outline-none focus:border-accent transition-colors appearance-none"
-            >
-              {CATEGORIES.map(c => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
+            <div className="relative">
+              <select
+                value={tid}
+                onChange={e => setTid(Number(e.target.value))}
+                className="w-full bg-surface-elevated border border-surface-border rounded-sm px-3 py-2 pr-8 text-sm text-fg outline-none focus:border-accent transition-colors appearance-none cursor-pointer"
+              >
+                {CATEGORIES.map(c => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+              {/* custom dropdown arrow */}
+              <svg className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-fg-muted" width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M2.5 4.5L6 8l3.5-3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </div>
           </div>
 
           {/* Tags */}
