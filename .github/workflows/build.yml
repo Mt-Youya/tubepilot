@@ -67,7 +67,7 @@ jobs:
           - os: windows-latest
             platform: windows-x64
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
