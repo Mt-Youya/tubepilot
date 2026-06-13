@@ -99,6 +99,8 @@ pub struct BiliCredentials {
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub download_dir: String,
+    pub cookie_browser: String,
+    pub proxy: String,
 }
 
 impl Default for AppSettings {
@@ -109,7 +111,7 @@ impl Default for AppSettings {
             .join("TubePilot")
             .to_string_lossy()
             .to_string();
-        AppSettings { download_dir: dir }
+        AppSettings { download_dir: dir, cookie_browser: "auto".to_string(), proxy: String::new() }
     }
 }
 
@@ -643,7 +645,27 @@ async fn start_publish_job(
                     app_clone.emit("job:updated", job.clone()).ok();
                 }
             }
-            Err(e) => set_job_error(&job_id_clone, e, &app_clone),
+            Err(e) => {
+                // Fallback: try reading result from file (pipe may lose last line)
+                let result_path = std::env::temp_dir()
+                    .join("tubepilot")
+                    .join(&job_id_clone)
+                    .join("publish_result.json");
+                if let Ok(data) = std::fs::read_to_string(&result_path) {
+                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(&data) {
+                        let bvid = result["bvid"].as_str().unwrap_or("").to_string();
+                        let app_state = app_clone.state::<AppState>();
+                        let mut jobs = app_state.jobs.lock().unwrap();
+                        if let Some(job) = jobs.get_mut(&job_id_clone) {
+                            job.status = JobStatus::Done;
+                            job.status_note = Some(format!("已发布 {bvid}"));
+                            app_clone.emit("job:updated", job.clone()).ok();
+                        }
+                        return;
+                    }
+                }
+                set_job_error(&job_id_clone, e, &app_clone)
+            }
         }
     });
 
@@ -661,7 +683,7 @@ async fn run_pipeline(job_id: String, url: String, app: AppHandle) {
     };
 
     if !has_title {
-        let meta = match sidecar_fetch_metadata(&url).await {
+        let meta = match sidecar_fetch_metadata(&url, &app).await {
             Ok(m) => m,
             Err(e) => { set_job_error(&job_id, e, &app); return; }
         };
@@ -852,6 +874,28 @@ async fn run_sidecar(
             env.insert("TRANSLATE_PROVIDER".to_string(), "bing".to_string());
         }
     }
+    // Pass cookie browser from user settings (env var takes priority)
+    if !env.contains_key("YTDLP_COOKIES_BROWSER") {
+        let cookie = {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
+            settings.cookie_browser.clone()
+        };
+        if cookie != "auto" {
+            env.insert("YTDLP_COOKIES_BROWSER".to_string(), cookie);
+        }
+    }
+    // Pass proxy from user settings (env var takes priority)
+    if !env.contains_key("YTDLP_PROXY") && !env.contains_key("HTTPS_PROXY") && !env.contains_key("https_proxy") {
+        let proxy = {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
+            settings.proxy.clone()
+        };
+        if !proxy.is_empty() {
+            env.insert("YTDLP_PROXY".to_string(), proxy);
+        }
+    }
 
     let mut child = tokio::process::Command::new(python_exe())
         .arg(sidecar_path())
@@ -914,19 +958,27 @@ async fn run_sidecar(
         };
 
         return Err(if python_msg.is_empty() {
-            format!("{}处理失败（exit {}）", step_ctx, status)
+            format!("{}处理失败（{}）", step_ctx, status)
         } else {
             format!("{}失败：{}", step_ctx, python_msg)
         });
     }
 
-    last_result.ok_or_else(|| "处理程序未返回结果".to_string())
+    last_result.ok_or_else(|| {
+        let stderr_tail: String = stderr_out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if stderr_tail.is_empty() {
+            "处理程序未返回结果".to_string()
+        } else {
+            format!("处理程序未返回结果（stderr: {}）", stderr_tail)
+        }
+    })
 }
 
 // ── Translation (Rust-native, no Python) ─────────────────────────────────────
-
-use std::sync::OnceLock;
-use tokio::sync::Semaphore;
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
@@ -941,11 +993,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-// Rate limiter: max 4 concurrent Tencent requests, each slot released after 1 s
-static TENCENT_SEM: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
-fn tencent_sem() -> std::sync::Arc<Semaphore> {
-    TENCENT_SEM.get_or_init(|| std::sync::Arc::new(Semaphore::new(4))).clone()
-}
 
 async fn tencent_translate_one(text: &str, secret_id: &str, secret_key: &str) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1007,38 +1054,32 @@ async fn tencent_translate_all(
     job_id: &str,
     app: &AppHandle,
 ) -> Result<Vec<String>, String> {
-    use tokio::task::JoinSet;
-
     let total = texts.len();
-    let sem   = tencent_sem();
-    let mut set: JoinSet<(usize, Result<String, String>)> = JoinSet::new();
+    let mut results = vec![String::new(); total];
 
     for (i, text) in texts.iter().enumerate() {
-        let text  = text.clone();
-        let sid   = secret_id.to_string();
-        let skey  = secret_key.to_string();
-        let sem   = sem.clone();
+        // Space requests evenly: 250ms gap = 4 QPS (safe under 5 QPS limit)
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
 
-        set.spawn(async move {
-            // Acquire rate-limit slot, release after 1 s
-            let permit = sem.acquire_owned().await.expect("semaphore closed");
-            let result = tencent_translate_one(&text, &sid, &skey).await;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                drop(permit);
-            });
-            (i, result)
-        });
-    }
+        for retry in 0..3 {
+            match tencent_translate_one(text, secret_id, secret_key).await {
+                Ok(translated) => {
+                    results[i] = translated;
+                    break;
+                }
+                Err(e) => {
+                    if retry == 2 {
+                        return Err(format!("翻译第 {i} 条失败（已重试 3 次）：{e}"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
 
-    let mut results  = vec![String::new(); total];
-    let mut done     = 0usize;
-    while let Some(res) = set.join_next().await {
-        let (idx, translated) = res.map_err(|e| e.to_string())?;
-        results[idx] = translated.map_err(|e| format!("翻译第 {idx} 条失败：{e}"))?;
-        done += 1;
-        if done % 20 == 0 || done == total {
-            set_job_note(job_id, &format!("正在翻译字幕...({done}/{total})"), app);
+        if (i + 1) % 50 == 0 || i + 1 == total {
+            set_job_note(job_id, &format!("正在翻译字幕...({}/{total})", i + 1), app);
         }
     }
     Ok(results)
@@ -1160,12 +1201,24 @@ struct VideoMetadata {
 }
 
 // Calls: python3 sidecar/main.py fetch-metadata <url>
-async fn sidecar_fetch_metadata(url: &str) -> Result<VideoMetadata, String> {
-    let output = tokio::process::Command::new(python_exe())
-        .arg(sidecar_path())
+async fn sidecar_fetch_metadata(url: &str, app: &AppHandle) -> Result<VideoMetadata, String> {
+    let (cookie_browser, proxy) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap();
+        (settings.cookie_browser.clone(), settings.proxy.clone())
+    };
+
+    let mut cmd = tokio::process::Command::new(python_exe());
+    cmd.arg(sidecar_path())
         .arg("fetch-metadata")
-        .arg(url)
-        .output()
+        .arg(url);
+    if cookie_browser != "auto" {
+        cmd.env("YTDLP_COOKIES_BROWSER", &cookie_browser);
+    }
+    if !proxy.is_empty() {
+        cmd.env("YTDLP_PROXY", &proxy);
+    }
+    let output = cmd.output()
         .await
         .map_err(|e| format!("无法启动处理程序：{e}"))?;
 
@@ -1234,13 +1287,33 @@ fn persist_settings(settings: &AppSettings, app: &AppHandle) {
 
 // ── Video download sidecar ────────────────────────────────────────────────────
 
-// Calls: python3 sidecar/main.py download <job_id> <url> <output_dir>
-// Background-only: updates video_download_pct and video_path in job state.
+// Downloads video in background, updates video_download_pct / video_path.
+// On failure, sets job error so user knows BEFORE reaching the publish step.
 async fn sidecar_download(job_id: &str, url: &str, output_dir: &str, app: &AppHandle) {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
-    let env = load_dot_env();
+    let mut env = load_dot_env();
+    if !env.contains_key("YTDLP_COOKIES_BROWSER") {
+        let cookie = {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
+            settings.cookie_browser.clone()
+        };
+        if cookie != "auto" {
+            env.insert("YTDLP_COOKIES_BROWSER".to_string(), cookie);
+        }
+    }
+    if !env.contains_key("YTDLP_PROXY") && !env.contains_key("HTTPS_PROXY") && !env.contains_key("https_proxy") {
+        let proxy = {
+            let state = app.state::<AppState>();
+            let settings = state.settings.lock().unwrap();
+            settings.proxy.clone()
+        };
+        if !proxy.is_empty() {
+            env.insert("YTDLP_PROXY".to_string(), proxy);
+        }
+    }
     let mut child = match tokio::process::Command::new(python_exe())
         .arg(sidecar_path())
         .args(["download", job_id, url, output_dir])
@@ -1250,14 +1323,17 @@ async fn sidecar_download(job_id: &str, url: &str, output_dir: &str, app: &AppHa
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => { eprintln!("sidecar_download spawn error: {e}"); return; }
+        Err(e) => { set_job_error(job_id, format!("无法启动下载：{e}"), app); return; }
     };
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let _stderr_task = tokio::spawn(async move {
+
+    // Capture stderr alongside stdout
+    let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
         let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+        buf
     });
 
     let mut lines = BufReader::new(stdout).lines();
@@ -1283,7 +1359,24 @@ async fn sidecar_download(job_id: &str, url: &str, output_dir: &str, app: &AppHa
             }
         }
     }
-    let _ = child.wait().await;
+
+    let status = child.wait().await;
+    let stderr_out = stderr_task.await.unwrap_or_default();
+
+    // Report download failure to job state
+    if status.map_or(true, |s| !s.success()) {
+        let msg = stderr_out
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["message"].as_str().map(|s| s.to_string()))
+            .last()
+            .unwrap_or_else(|| {
+                let trimmed = stderr_out.trim().to_string();
+                if trimmed.is_empty() { "视频下载失败，请检查网络和代理设置".to_string() }
+                else { trimmed }
+            });
+        set_job_error(job_id, format!("【视频下载】失败：{msg}"), app);
+    }
 }
 
 fn sidecar_path() -> std::path::PathBuf {

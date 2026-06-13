@@ -229,20 +229,38 @@ def fetch_metadata(url: str) -> None:
         fatal("yt-dlp not installed — run: pip install yt-dlp")
 
     _node = _find_node()
-    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True,
-                 **_cookie_opts(), **_proxy_opts(),
-                 **(_node and {"js_runtimes": {"node": {"path": _node}}} or {})}
+    cookie_opts = _cookie_opts()
+    proxy_opts = _proxy_opts()
     info = None
     last_err = None
-    for extra in ({}, {"nocheckcertificate": True}):  # retry without SSL verify on failure
-        try:
-            with yt_dlp.YoutubeDL({**base_opts, **extra}) as ydl:
-                info = ydl.extract_info(url, download=False)
+
+    # Build retry configs: try cookies first, fall back on specific errors
+    configs: list = [(True, False), (True, True)]
+    if cookie_opts:
+        configs += [(False, False), (False, True)]  # cookie error fallback
+
+    for use_cookies, noverify in configs:
+        c_opts = cookie_opts if use_cookies else {}
+        base_opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                     **c_opts, **proxy_opts,
+                     **(_node and {"js_runtimes": {"node": {"path": _node}}} or {})}
+        extra = {"nocheckcertificate": True} if noverify else {}
+
+        for attempt in range(3):
+            try:
+                with yt_dlp.YoutubeDL({**base_opts, **extra}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                break
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                if "reload" in err_str and attempt < 2:
+                    time.sleep(3)
+                    continue
+                break  # try next config
+        if info is not None:
             break
-        except Exception as e:
-            last_err = e
-            if "SSL" not in str(e) and "EOF" not in str(e):
-                break  # non-SSL error, no point retrying
+
     if info is None:
         fatal(f"yt-dlp metadata error: {last_err}")
 
@@ -306,6 +324,8 @@ def transcribe(job_id: str, url: str) -> None:
 
     # 3. Fallback: Whisper ───────────────────────────────────────────────────────
     progress("transcribe", "whisper_fallback", 25)
+    # Anaconda Python has a known OpenMP DLL conflict with PyTorch
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     try:
         import whisper
     except ImportError:
@@ -313,21 +333,28 @@ def transcribe(job_id: str, url: str) -> None:
               "Run: pip install openai-whisper  (or ensure the video has captions)")
 
     _node = _find_node()
-    ydl_audio_opts = {
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
-        "outtmpl": str(work_dir / "audio.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        **_cookie_opts(),
-        **_proxy_opts(),
-        **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_audio_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        fatal(f"Audio download error: {e}")
+    proxy_opts = _proxy_opts()
+    last_audio_err = None
+
+    for use_cookies in (True, False):
+        cookie_opts = _cookie_opts() if use_cookies else {}
+        ydl_audio_opts = {
+            "format": "bestaudio/best",
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+            "outtmpl": str(work_dir / "audio.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            **cookie_opts, **proxy_opts,
+            **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_audio_opts) as ydl:
+                ydl.download([url])
+            break
+        except Exception as e:
+            last_audio_err = e
+    else:
+        fatal(f"Audio download error: {last_audio_err}")
 
     audio_path = work_dir / "audio.mp3"
     if not audio_path.exists():
@@ -381,18 +408,20 @@ def _fetch_timedtext(video_id: str, tlang: str | None) -> str | None:
         params["tlang"] = tlang
 
     proxy = _proxy_opts().get("proxy")
-    try:
-        resp = requests.get(
-            "https://www.youtube.com/api/timedtext",
-            params=params,
-            timeout=20,
-            headers={"User-Agent": "Mozilla/5.0"},
-            proxies={"https": proxy, "http": proxy} if proxy else None,
-        )
-        if resp.status_code == 200 and "WEBVTT" in resp.text:
-            return resp.text
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                "https://www.youtube.com/api/timedtext",
+                params=params,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
+                proxies={"https": proxy, "http": proxy} if proxy else None,
+            )
+            if resp.status_code == 200 and "WEBVTT" in resp.text:
+                return resp.text
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
     return None
 
 
@@ -402,44 +431,49 @@ def _download_subtitles_multi(url: str, langs: list[str], work_dir: Path) -> dic
     """
     import yt_dlp, shutil
 
-    for f in work_dir.glob("sub.*.*"):
-        try: f.unlink()
-        except Exception: pass
-
     node_path = _find_node()
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": langs,
-        "subtitlesformat": "vtt",
-        "outtmpl": str(work_dir / "sub.%(ext)s"),
-        "ignoreerrors": True,   # continue past 429 on individual languages
-        **_cookie_opts(),
-        **_proxy_opts(),
-        **({"js_runtimes": {"node": {"path": node_path}}} if node_path else {}),
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception:
-        pass  # check what was actually written
+    proxy_opts = _proxy_opts()
 
-    result = {}
-    for lang in langs:
-        for ext in ["vtt", "srt"]:
-            p = work_dir / f"sub.{lang}.{ext}"
-            if p.exists():
-                try:
-                    content = p.read_text(encoding="utf-8")
-                    if content.strip():
-                        result[lang] = content
-                        break
-                except Exception:
-                    pass
-    return result
+    for use_cookies in (True, False):
+        cookie_opts = _cookie_opts() if use_cookies else {}
+        for f in work_dir.glob("sub.*.*"):
+            try: f.unlink()
+            except Exception: pass
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": langs,
+            "subtitlesformat": "vtt",
+            "outtmpl": str(work_dir / "sub.%(ext)s"),
+            "ignoreerrors": True,
+            **cookie_opts, **proxy_opts,
+            **({"js_runtimes": {"node": {"path": node_path}}} if node_path else {}),
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception:
+            pass
+
+        result = {}
+        for lang in langs:
+            for ext in ["vtt", "srt"]:
+                p = work_dir / f"sub.{lang}.{ext}"
+                if p.exists():
+                    try:
+                        content = p.read_text(encoding="utf-8")
+                        if content.strip():
+                            result[lang] = content
+                            break
+                    except Exception:
+                        pass
+        if result:
+            return result
+    return {}
 
 
 def _download_subtitle(url: str, lang_candidates: list[str], work_dir: Path) -> str | None:
@@ -660,10 +694,21 @@ def _tencent_translate(texts: list[str], secret_id: str, secret_key: str) -> lis
 def publish(job_id: str, meta_file: str) -> None:
     """Download YouTube video then upload to Bilibili via biliup."""
     try:
+        _publish(job_id, meta_file)
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        fatal(f"发布失败：{e}")
+
+
+def _publish(job_id: str, meta_file: str) -> None:
+    sys.stderr.write(f"[DEBUG] _publish start, meta={meta_file}\n"); sys.stderr.flush()
+    try:
         with open(meta_file, encoding="utf-8") as f:
             meta = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         fatal(f"Failed to read meta file: {e}")
+    sys.stderr.write(f"[DEBUG] meta loaded, url={meta.get('url','?')}\n"); sys.stderr.flush()
 
     url        = meta["url"]
     title      = meta.get("title", "")
@@ -696,7 +741,10 @@ def publish(job_id: str, meta_file: str) -> None:
         progress("publish", "upload_video", 40)  # skip to upload
     else:
         progress("publish", "download_video", 5)
-        video_path = _download_video(url, work_dir)
+        try:
+            video_path = _download_video(url, work_dir)
+        except Exception as e:
+            fatal(f"视频下载失败：{e}")
 
     # 2. Export subtitles as SRT
     srt_path = None
@@ -745,6 +793,7 @@ def publish(job_id: str, meta_file: str) -> None:
             pass  # non-fatal: keep original text
 
     # 5. Upload to Bilibili
+    sys.stderr.write(f"[DEBUG] starting B站 upload, video={video_path}\n"); sys.stderr.flush()
     progress("publish", "upload_video", 40)
     cookie = {
         "cookie_info": {
@@ -811,7 +860,14 @@ def publish(job_id: str, meta_file: str) -> None:
         _upload_bili_cc_subtitle(bvid, subtitles, sessdata, bili_jct)
 
     progress("publish", "done", 100)
-    print(json.dumps({"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}"}), flush=True)
+    sys.stderr.write(f"[DEBUG] publish done, bvid={bvid}\n"); sys.stderr.flush()
+    result = {"bvid": bvid, "url": f"https://www.bilibili.com/video/{bvid}"}
+    # Write result to file AND stdout — file as fallback for pipe issues
+    result_path = work_dir / "publish_result.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    print(json.dumps(result), flush=True)
+    # Give OS pipe time to deliver last line before process exits
+    time.sleep(0.5)
 
 
 def download_video_cmd(job_id: str, url: str, output_dir: str) -> None:
@@ -850,26 +906,48 @@ def _download_video(url: str, work_dir: Path, *, progress_hook=None) -> Path:
     """Download best quality mp4 video via yt-dlp (4 concurrent fragments)."""
     import yt_dlp
     _node = _find_node()
-    opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": str(work_dir / "video.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 4,
-        **_cookie_opts(),
-        **_proxy_opts(),
-        **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
-    }
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-    for ext in ["mp4", "mkv", "webm"]:
-        p = work_dir / f"video.{ext}"
-        if p.exists():
-            return p
-    raise FileNotFoundError("视频下载后文件不存在")
+    proxy_opts = _proxy_opts()
+    last_err = None
+
+    for use_cookies in (True, False):
+        cookie_opts = _cookie_opts() if use_cookies else {}
+        for noverify in (False, True):
+            opts = {
+                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "outtmpl": str(work_dir / "video.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "merge_output_format": "mp4",
+                "concurrent_fragment_downloads": 1,
+                "continuedl": True,
+                "retries": 50,
+                "fragment_retries": 50,
+                "file_access_retries": 10,
+                "sleep_interval": 5,
+                "max_sleep_interval": 60,
+                **cookie_opts, **proxy_opts,
+                **(_node and {"js_runtimes": {"node": {"path": _node}}} or {}),
+            }
+            if noverify:
+                opts["nocheckcertificate"] = True
+            if progress_hook:
+                opts["progress_hooks"] = [progress_hook]
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                break
+            except Exception as e:
+                last_err = e
+                if "ssl" not in str(e).lower() and "eof" not in str(e).lower():
+                    break  # non-SSL error, skip noverify retry
+        else:
+            continue  # both SSL attempts failed, try without cookies
+        for ext in ["mp4", "mkv", "webm"]:
+            p = work_dir / f"video.{ext}"
+            if p.exists():
+                return p
+
+    raise FileNotFoundError(f"视频下载失败：{last_err}")
 
 
 def _segs_to_srt(segs: list) -> str:
@@ -1035,4 +1113,11 @@ def _fmt_duration(secs: int) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        if isinstance(e, SystemExit):
+            raise  # preserve exit code
+        fatal(f"未捕获异常：{e}")

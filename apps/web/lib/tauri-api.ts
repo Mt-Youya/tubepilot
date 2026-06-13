@@ -186,6 +186,8 @@ export function onJobDeleted(handler: (id: string) => void): Promise<UnlistenFn>
 
 export interface AppSettings {
   downloadDir: string;
+  cookieBrowser: string;
+  proxy: string;
 }
 
 export function getSettings(): Promise<AppSettings> {

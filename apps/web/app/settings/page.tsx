@@ -36,6 +36,20 @@ export default function SettingsPage() {
     await saveSettings(next).catch(console.error);
   }
 
+  function handleCookieBrowserChange(val: string) {
+    if (!settings) return;
+    const next = { ...settings, cookieBrowser: val };
+    setSettings(next);
+    saveSettings(next).catch(console.error);
+  }
+
+  function handleProxyChange(val: string) {
+    if (!settings) return;
+    const next = { ...settings, proxy: val };
+    setSettings(next);
+    saveSettings(next).catch(console.error);
+  }
+
   // Load current user on mount
   useEffect(() => {
     getBiliUser()
@@ -220,6 +234,53 @@ export default function SettingsPage() {
               >
                 选择文件夹
               </button>
+            </div>
+          </div>
+        </section>
+
+        {/* Section: Cookie Browser */}
+        <section className="mt-8">
+          <h2 className="text-[11px] font-semibold tracking-[0.12em] uppercase text-fg-muted mb-4">
+            YouTube Cookie
+          </h2>
+          <div className="bg-surface-raised border border-surface-border rounded-sm p-4">
+            <p className="text-[11px] text-fg-muted mb-3 leading-relaxed">
+              使用浏览器登录态获取视频信息。如果遇到「Could not copy Chrome cookie database」报错，请关闭该浏览器后重试，或切换为"不使用 Cookie"。
+            </p>
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-fg-muted flex-shrink-0">来源</label>
+              <select
+                value={settings?.cookieBrowser ?? "auto"}
+                onChange={(e) => handleCookieBrowserChange(e.target.value)}
+                className="flex-1 px-3 py-1.5 bg-surface-elevated border border-surface-border rounded-sm text-xs text-fg outline-none focus:border-accent transition-colors appearance-none cursor-pointer"
+              >
+                <option value="auto">自动检测</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+                <option value="firefox">Firefox</option>
+                <option value="none">不使用 Cookie</option>
+              </select>
+            </div>
+          </div>
+        </section>
+
+        {/* Section: Proxy */}
+        <section className="mt-8">
+          <h2 className="text-[11px] font-semibold tracking-[0.12em] uppercase text-fg-muted mb-4">
+            网络代理
+          </h2>
+          <div className="bg-surface-raised border border-surface-border rounded-sm p-4">
+            <p className="text-[11px] text-fg-muted mb-3 leading-relaxed">
+              访问 YouTube 所需的 HTTP 代理地址。留空则自动检测系统代理。
+            </p>
+            <div className="flex items-center gap-3">
+              <input
+                type="text"
+                value={settings?.proxy ?? ""}
+                onChange={(e) => handleProxyChange(e.target.value)}
+                placeholder="例如 http://127.0.0.1:7890"
+                className="flex-1 px-3 py-1.5 bg-surface-elevated border border-surface-border rounded-sm text-xs text-fg outline-none focus:border-accent transition-colors font-mono"
+              />
             </div>
           </div>
         </section>
