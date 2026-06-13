@@ -988,11 +988,15 @@ def _upload_bili_cc_subtitle(
     Non-fatal: errors are silently swallowed so publish still succeeds.
     """
     if not segments or not bvid:
+        sys.stderr.write(f"[DEBUG] CC sub skip: segs={len(segments) if segments else 0} bvid={bvid}\n"); sys.stderr.flush()
         return
     try:
         import requests as _req
     except ImportError:
+        sys.stderr.write("[DEBUG] CC sub skip: requests not installed\n"); sys.stderr.flush()
         return
+
+    sys.stderr.write(f"[DEBUG] CC sub start: bvid={bvid} segs={len(segments)}\n"); sys.stderr.flush()
 
     session = _req.Session()
     session.cookies.set("SESSDATA", sessdata)
@@ -1009,7 +1013,9 @@ def _upload_bili_cc_subtitle(
             "https://api.bilibili.com/x/web-interface/view",
             params={"bvid": bvid}, timeout=20,
         )
-        cid = r.json().get("data", {}).get("cid")
+        resp_json = r.json()
+        cid = resp_json.get("data", {}).get("cid")
+        sys.stderr.write(f"[DEBUG] CC sub get cid: {cid}, api_code={resp_json.get('code')}\n"); sys.stderr.flush()
         if not cid:
             return
 
@@ -1021,10 +1027,11 @@ def _upload_bili_cc_subtitle(
                 body.append({
                     "from":     round(float(seg["inTime"]),  3),
                     "to":       round(float(seg["outTime"]), 3),
-                    "location": 2,   # bottom center
+                    "location": 2,
                     "content":  text,
                 })
         if not body:
+            sys.stderr.write("[DEBUG] CC sub skip: empty body\n"); sys.stderr.flush()
             return
 
         cc_data = json.dumps({
@@ -1037,7 +1044,7 @@ def _upload_bili_cc_subtitle(
         }, ensure_ascii=False)
 
         # 3. Upload subtitle draft
-        session.post(
+        r2 = session.post(
             "https://api.bilibili.com/x/v2/dm/subtitle/draft/save",
             data={
                 "type":   1,
@@ -1051,8 +1058,9 @@ def _upload_bili_cc_subtitle(
             },
             timeout=30,
         )
-    except Exception:
-        pass  # non-fatal — subtitle upload failure shouldn't block publish
+        sys.stderr.write(f"[DEBUG] CC sub upload: status={r2.status_code} resp={r2.text[:200]}\n"); sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[DEBUG] CC sub error: {e}\n"); sys.stderr.flush()
 
 
 # ── language / translation helpers ───────────────────────────────────────────

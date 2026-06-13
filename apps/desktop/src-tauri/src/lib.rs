@@ -1287,95 +1287,125 @@ fn persist_settings(settings: &AppSettings, app: &AppHandle) {
 
 // ── Video download sidecar ────────────────────────────────────────────────────
 
-// Downloads video in background, updates video_download_pct / video_path.
-// On failure, sets job error so user knows BEFORE reaching the publish step.
+// Downloads video in background, retries automatically on failure.
+// Never gives up — keeps retrying with increasing delays until success.
 async fn sidecar_download(job_id: &str, url: &str, output_dir: &str, app: &AppHandle) {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
-    let mut env = load_dot_env();
-    if !env.contains_key("YTDLP_COOKIES_BROWSER") {
-        let cookie = {
-            let state = app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            settings.cookie_browser.clone()
-        };
-        if cookie != "auto" {
-            env.insert("YTDLP_COOKIES_BROWSER".to_string(), cookie);
-        }
-    }
-    if !env.contains_key("YTDLP_PROXY") && !env.contains_key("HTTPS_PROXY") && !env.contains_key("https_proxy") {
-        let proxy = {
-            let state = app.state::<AppState>();
-            let settings = state.settings.lock().unwrap();
-            settings.proxy.clone()
-        };
-        if !proxy.is_empty() {
-            env.insert("YTDLP_PROXY".to_string(), proxy);
-        }
-    }
-    let mut child = match tokio::process::Command::new(python_exe())
-        .arg(sidecar_path())
-        .args(["download", job_id, url, output_dir])
-        .envs(&env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    // Check if already completed
     {
-        Ok(c) => c,
-        Err(e) => { set_job_error(job_id, format!("无法启动下载：{e}"), app); return; }
-    };
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    // Capture stderr alongside stdout
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
-        buf
-    });
-
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_string();
-        if line.is_empty() { continue; }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            let state = app.state::<AppState>();
-            if val.get("type").and_then(|t| t.as_str()) == Some("progress") {
-                let pct = val["percent"].as_u64().unwrap_or(0) as u8;
-                let mut jobs = state.jobs.lock().unwrap();
-                if let Some(job) = jobs.get_mut(job_id) {
-                    job.video_download_pct = Some(pct);
-                    app.emit("job:updated", job.clone()).ok();
-                }
-            } else if let Some(path) = val["video_path"].as_str() {
-                let mut jobs = state.jobs.lock().unwrap();
-                if let Some(job) = jobs.get_mut(job_id) {
-                    job.video_path = Some(path.to_string());
-                    job.video_download_pct = Some(100);
-                    app.emit("job:updated", job.clone()).ok();
+        let state = app.state::<AppState>();
+        let jobs = state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get(job_id) {
+            if let Some(ref path) = job.video_path {
+                if std::path::Path::new(path).exists() {
+                    return; // already downloaded
                 }
             }
         }
     }
 
-    let status = child.wait().await;
-    let stderr_out = stderr_task.await.unwrap_or_default();
+    let mut attempt = 0u32;
 
-    // Report download failure to job state
-    if status.map_or(true, |s| !s.success()) {
-        let msg = stderr_out
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|v| v["message"].as_str().map(|s| s.to_string()))
-            .last()
-            .unwrap_or_else(|| {
-                let trimmed = stderr_out.trim().to_string();
-                if trimmed.is_empty() { "视频下载失败，请检查网络和代理设置".to_string() }
-                else { trimmed }
-            });
-        set_job_error(job_id, format!("【视频下载】失败：{msg}"), app);
+    // Keep retrying until download succeeds or job is cancelled
+    loop {
+        attempt += 1;
+
+        // Check if job was cancelled
+        {
+            let state = app.state::<AppState>();
+            let jobs = state.jobs.lock().unwrap();
+            if let Some(job) = jobs.get(job_id) {
+                if job.status == JobStatus::Cancelled { return; }
+            }
+        }
+
+        let mut env = load_dot_env();
+        if !env.contains_key("YTDLP_COOKIES_BROWSER") {
+            let cookie = {
+                let state = app.state::<AppState>();
+                let settings = state.settings.lock().unwrap();
+                settings.cookie_browser.clone()
+            };
+            if cookie != "auto" {
+                env.insert("YTDLP_COOKIES_BROWSER".to_string(), cookie);
+            }
+        }
+        if !env.contains_key("YTDLP_PROXY") && !env.contains_key("HTTPS_PROXY") && !env.contains_key("https_proxy") {
+            let proxy = {
+                let state = app.state::<AppState>();
+                let settings = state.settings.lock().unwrap();
+                settings.proxy.clone()
+            };
+            if !proxy.is_empty() {
+                env.insert("YTDLP_PROXY".to_string(), proxy);
+            }
+        }
+
+        let mut child = match tokio::process::Command::new(python_exe())
+            .arg(sidecar_path())
+            .args(["download", job_id, url, output_dir])
+            .envs(&env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("sidecar_download spawn error: {e}");
+                // Wait and retry
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+            buf
+        });
+
+        let mut success = false;
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let state = app.state::<AppState>();
+                if val.get("type").and_then(|t| t.as_str()) == Some("progress") {
+                    let pct = val["percent"].as_u64().unwrap_or(0) as u8;
+                    let mut jobs = state.jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.video_download_pct = Some(pct);
+                        app.emit("job:updated", job.clone()).ok();
+                    }
+                } else if let Some(path) = val["video_path"].as_str() {
+                    let mut jobs = state.jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.video_path = Some(path.to_string());
+                        job.video_download_pct = Some(100);
+                        app.emit("job:updated", job.clone()).ok();
+                    }
+                    success = true;
+                }
+            }
+        }
+
+        let _ = child.wait().await;
+        let _ = stderr_task.await;
+
+        if success {
+            return; // download complete
+        }
+
+        // Download failed — wait with backoff and retry
+        let delay = std::cmp::min(attempt * 15, 120) as u64; // 15s → 30s → ... → max 120s
+        set_job_note(job_id, &format!("视频下载失败，{delay}秒后重试（第{attempt}次）..."), app);
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
     }
 }
 
